@@ -3,87 +3,145 @@ declare(strict_types=1);
 
 /**
 * MDRRMO Response Emergency System
-* PostgreSQL connection helper.
+* API: Retrieve emergency reports for the Command Center
 *
-* Requires DATABASE_URL in Render environment variables.
+* Endpoint:
+* GET /api/incidents/list.php
+*
+* Optional filters:
+* ?status=reported
+* ?type=Flood
+* ?limit=100
 */
 
-if (!function_exists('getDatabaseConnection')) {
-   function getDatabaseConnection(): PDO
-   {
-       static $pdo = null;
+header('Content-Type: application/json; charset=utf-8');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: GET, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 
-       if ($pdo instanceof PDO) {
-           return $pdo;
-       }
+function jsonResponse(int $statusCode, array $payload): void
+{
+   http_response_code($statusCode);
 
-       $databaseUrl = getenv('DATABASE_URL');
+   echo json_encode(
+       $payload,
+       JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE
+   );
 
-       if (!$databaseUrl) {
-           error_log('MDRRMO: DATABASE_URL is not configured.');
-           throw new RuntimeException(
-               'Database configuration is unavailable.'
-           );
-       }
+   exit;
+}
 
-       $db = parse_url($databaseUrl);
+// Handle browser CORS preflight requests.
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+   http_response_code(204);
+   exit;
+}
 
-       if (
-           $db === false ||
-           empty($db['host']) ||
-           empty($db['user']) ||
-           !isset($db['pass']) ||
-           empty($db['path']) ||
-           $db['path'] === '/'
-       ) {
-           error_log('MDRRMO: Invalid DATABASE_URL.');
-           throw new RuntimeException(
-               'Database configuration is invalid.'
-           );
-       }
+// This endpoint only accepts GET requests.
+if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+   header('Allow: GET, OPTIONS');
 
-       $host = $db['host'];
-       $port = (int) ($db['port'] ?? 5432);
-       $username = rawurldecode($db['user']);
-       $password = rawurldecode($db['pass']);
-       $database = rawurldecode(ltrim($db['path'], '/'));
+   jsonResponse(405, [
+       'success' => false,
+       'message' => 'Method not allowed. Use GET to retrieve incidents.'
+   ]);
+}
 
-       $query = [];
-       parse_str($db['query'] ?? '', $query);
+// Load the PostgreSQL connection helper.
+require_once _DIR_ . '/db_connection.php';
 
-       $sslmode = $query['sslmode']
-           ?? getenv('PGSSLMODE')
-           ?: 'require';
+try {
+   $pdo = getDatabaseConnection();
 
-       $dsn = sprintf(
-           'pgsql:host=%s;port=%d;dbname=%s;sslmode=%s',
-           $host,
-           $port,
-           $database,
-           $sslmode
-       );
+   $sql = '
+       SELECT
+           incident_id,
+           emergency_type,
+           description,
+           persons_affected,
+           latitude,
+           longitude,
+           gps_accuracy,
+           status,
+           reported_at
+       FROM public.emergency_incidents
+       WHERE 1 = 1
+   ';
 
-       try {
-           $pdo = new PDO($dsn, $username, $password, [
-               PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-               PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-               PDO::ATTR_EMULATE_PREPARES => false,
-               PDO::ATTR_TIMEOUT => 10
-           ]);
+   $params = [];
 
-           return $pdo;
+   // Optional status filter.
+   if (isset($_GET['status']) && trim((string) $_GET['status']) !== '') {
+       $sql .= ' AND LOWER(status) = LOWER(:status)';
+       $params['status'] = trim((string) $_GET['status']);
+   }
 
-       } catch (PDOException $e) {
-           error_log(
-               'MDRRMO PostgreSQL connection failed: ' .
-               $e->getMessage()
-           );
+   // Optional emergency type filter.
+   if (isset($_GET['type']) && trim((string) $_GET['type']) !== '') {
+       $sql .= ' AND LOWER(emergency_type) = LOWER(:type)';
+       $params['type'] = trim((string) $_GET['type']);
+   }
 
-           throw new RuntimeException(
-               'Database connection failed.',
-               0,
-               $e
-           );
+   $sql .= ' ORDER BY reported_at DESC NULLS LAST, incident_id DESC';
+
+   // Default to 100; maximum 500.
+   $requestedLimit = filter_input(
+       INPUT_GET,
+       'limit',
+       FILTER_VALIDATE_INT
+   );
+
+   if ($requestedLimit === false || $requestedLimit === null) {
+       $requestedLimit = 100;
+   }
+
+   $limit = max(1, min(500, $requestedLimit));
+   $sql .= ' LIMIT ' . $limit;
+
+   $stmt = $pdo->prepare($sql);
+   $stmt->execute($params);
+
+   $incidents = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+   // Return numeric fields as JSON numbers.
+   foreach ($incidents as &$incident) {
+       $incident['incident_id'] = (int) $incident['incident_id'];
+
+       foreach ([
+           'persons_affected',
+           'latitude',
+           'longitude',
+           'gps_accuracy'
+       ] as $field) {
+           if (
+               array_key_exists($field, $incident) &&
+               $incident[$field] !== null &&
+               $incident[$field] !== '' &&
+               is_numeric($incident[$field])
+           ) {
+               $incident[$field] = (float) $incident[$field];
+           }
        }
    }
+
+   unset($incident);
+
+   jsonResponse(200, [
+       'success' => true,
+       'message' => 'Emergency reports retrieved successfully.',
+       'count' => count($incidents),
+       'data' => $incidents
+   ]);
+
+} catch (Throwable $e) {
+   // Keep database and technical details in Render logs.
+   error_log(
+       'MDRRMO incident list API error: ' . $e->getMessage()
+   );
+
+   jsonResponse(500, [
+       'success' => false,
+       'message' => 'Unable to retrieve incident reports. Check the Render server logs.'
+   ]);
 }
